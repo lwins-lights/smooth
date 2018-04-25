@@ -117,6 +117,12 @@ struct bbr {
 		unused_b:5;
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
+	/*
+	 * SMOOTH parameters
+	 */
+	u32 dec_rtt_us;	/* decent RTT estimation */
+	u32 rtt_avg;	/* ~ E[RTT] */
+	u64 rtt_sqr;	/* ~ E[RTT^2] */
 };
 
 #define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
@@ -175,6 +181,34 @@ static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
 static const u32 bbr_lt_bw_diff = 4000 / 8;
 /* If we estimate we're policed, use lt_bw for this many round trips: */
 static const u32 bbr_lt_bw_max_rtts = 48;
+
+/* 
+ * SMOOTH constants 
+ */
+
+/* coefficient for EWMV (Variance) of RTTs */
+static const u32 smooth_rtt_decay_coef = 25;
+/* the shape parameter for the gamma distribution of RTTs */
+#define SMOOTH_GAMMA_ALPHA 1/2
+/* maximal iteration depth for smooth_sqrt() */
+static const u32 smooth_newton_max_iter = 100;
+
+/* SMOOTH: Newton's iteration */
+static u64 smooth_sqrt(u64 n)
+{
+	u64 x, y, i;
+
+	if (n == 0)
+		return 0;
+	y = 1;
+	i = 0;
+	do {
+		x = y;
+		y = (x + n / x) / 2;
+		i = i + 1;
+	} while (x != y || i >= smooth_newton_max_iter);
+	return y;
+}
 
 /* Do we estimate that STARTUP filled the pipe? */
 static bool bbr_full_bw_reached(const struct sock *sk)
@@ -342,7 +376,7 @@ static u32 bbr_target_cwnd(struct sock *sk, u32 bw, int gain)
 	if (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
 		return TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
 
-	w = (u64)bw * bbr->min_rtt_us;
+	w = (u64)bw * bbr->dec_rtt_us;	/* SMOOTH */
 
 	/* Apply a gain to the given value, then remove the BW_SCALE shift. */
 	cwnd = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
@@ -444,7 +478,7 @@ static bool bbr_is_next_cycle_phase(struct sock *sk,
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool is_full_length =
 		tcp_stamp_us_delta(tp->delivered_mstamp, bbr->cycle_mstamp) >
-		bbr->min_rtt_us;
+		bbr->dec_rtt_us;	/* SMOOTH */
 	u32 inflight, bw;
 
 	/* The pacing_gain of 1.0 paces at the estimated bw to try to fully
@@ -761,6 +795,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool filter_expired;
+	u64 rtt_std;	/* SMOOTH */
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
 	filter_expired = after(tcp_jiffies32,
@@ -804,6 +839,13 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 	bbr->idle_restart = 0;
+
+	/* SMOOTH */
+	if (rs->rtt_us >= 0) {
+		bbr->rtt_avg = (bbr->rtt_avg * (smooth_rtt_decay_coef - 1) + rs->rtt_us) / smooth_rtt_decay_coef;
+		bbr->rtt_sqr = (bbr->rtt_sqr * (smooth_rtt_decay_coef - 1) + (u64)rs->rtt_us * rs->rtt_us) / smooth_rtt_decay_coef;
+		bbr->dec_rtt_us = bbr->min_rtt_us + smooth_sqrt(bbr->rtt_sqr - (u64)bbr->rtt_avg * bbr->rtt_avg) * SMOOTH_GAMMA_ALPHA;
+	}
 }
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
@@ -844,6 +886,10 @@ static void bbr_init(struct sock *sk)
 	bbr->probe_rtt_round_done = 0;
 	bbr->min_rtt_us = tcp_min_rtt(tp);
 	bbr->min_rtt_stamp = tcp_jiffies32;
+	/* SMOOTH */
+	bbr->dec_rtt_us = tcp_min_rtt(tp);
+	bbr->rtt_avg = 0;
+	bbr->rtt_sqr = 0;
 
 	minmax_reset(&bbr->bw, bbr->rtt_cnt, 0);  /* init max bw to 0 */
 
@@ -945,6 +991,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
+	printk("SMOOTH: v0.001.\n")	/* SMOOTH */
 }
 
 static void __exit bbr_unregister(void)
