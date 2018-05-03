@@ -117,9 +117,7 @@ struct bbr {
 		unused_b:5;
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
-	/*
-	 * SMOOTH parameters
-	 */
+	/* SMOOTH parameters */
 	u32 dec_rtt_us;	/* decent RTT estimation */
 	u32 rtt_avg;	/* ~ E[RTT] */
 	u64 rtt_sqr;	/* ~ E[RTT^2] */
@@ -187,7 +185,7 @@ static const u32 bbr_lt_bw_max_rtts = 48;
  */
 
 /* coefficient for EWMV (Variance) of RTTs */
-static const u32 smooth_rtt_decay_coef = 25;
+static const u32 smooth_rtt_decay_coef = 16;
 /* the shape parameter for the gamma distribution of RTTs */
 #define SMOOTH_GAMMA_ALPHA 1/2
 /* maximal iteration depth for smooth_sqrt() */
@@ -206,7 +204,7 @@ static u64 smooth_sqrt(u64 n)
 		x = y;
 		y = (x + n / x) / 2;
 		i = i + 1;
-	} while (x != y || i >= smooth_newton_max_iter);
+	} while (x != y && i < smooth_newton_max_iter);
 	return y;
 }
 
@@ -795,7 +793,6 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool filter_expired;
-	u64 rtt_std;	/* SMOOTH */
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
 	filter_expired = after(tcp_jiffies32,
@@ -844,8 +841,23 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	if (rs->rtt_us >= 0) {
 		bbr->rtt_avg = (bbr->rtt_avg * (smooth_rtt_decay_coef - 1) + rs->rtt_us) / smooth_rtt_decay_coef;
 		bbr->rtt_sqr = (bbr->rtt_sqr * (smooth_rtt_decay_coef - 1) + (u64)rs->rtt_us * rs->rtt_us) / smooth_rtt_decay_coef;
-		bbr->dec_rtt_us = bbr->min_rtt_us + smooth_sqrt(bbr->rtt_sqr - (u64)bbr->rtt_avg * bbr->rtt_avg) * SMOOTH_GAMMA_ALPHA;
 	}
+	bbr->dec_rtt_us = bbr->min_rtt_us + smooth_sqrt(bbr->rtt_sqr - (u64)bbr->rtt_avg * bbr->rtt_avg) * SMOOTH_GAMMA_ALPHA;
+}
+
+/* SMOOTH */
+static void smooth_report_parameters(struct sock *sk, const struct rate_sample *rs) 
+{
+	struct inet_sock *inet = inet_sk(sk);
+	struct bbr *bbr = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+	u64 bw = bbr_bw(sk);
+
+	bw = bw * tp->mss_cache * USEC_PER_SEC >> BW_SCALE;
+
+	printk("SMOOTH: %pI4:%u->%pI4:%u\nbw\trtt\tmin_rtt\tdec_rtt\tlt_flag\tstate\n%u\t%u\t%u\t%u\t%u\t%u\n",
+	 &(inet->inet_saddr), ntohs(inet->inet_sport), &(inet->inet_daddr),
+	  ntohs(inet->inet_dport), (u32)bw, (u32)rs->rtt_us, bbr->min_rtt_us, bbr->dec_rtt_us, (u32)((bool)bbr->lt_is_sampling), (u32)bbr->mode);
 }
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
@@ -855,6 +867,7 @@ static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
 	bbr_check_full_bw_reached(sk, rs);
 	bbr_check_drain(sk, rs);
 	bbr_update_min_rtt(sk, rs);
+	smooth_report_parameters(sk, rs);	/* SMOOTH */
 }
 
 static void bbr_main(struct sock *sk, const struct rate_sample *rs)
@@ -990,8 +1003,8 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
+	printk("SMOOTH: v0.005\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
-	printk("SMOOTH: v0.001.\n")	/* SMOOTH */
 }
 
 static void __exit bbr_unregister(void)
