@@ -138,8 +138,8 @@ struct inet_connection_sock {
 	} icsk_mtup;
 	u32			  icsk_user_timeout;
 
-	u64			  icsk_ca_priv[104 / sizeof(u64)];	/* SMOOTH */
-#define ICSK_CA_PRIV_SIZE      (13 * sizeof(u64))	/* SMOOTH */
+	u64			  icsk_ca_priv[128 / sizeof(u64)];	/* SMOOTH */
+#define ICSK_CA_PRIV_SIZE      (16 * sizeof(u64))	/* SMOOTH */
 };
 
 #define ICSK_TIME_RETRANS	1	/* Retransmit timer */
