@@ -197,7 +197,7 @@ static const u32 bbr_lt_bw_max_rtts = 48;
 /* the (1/e)-life of the weight for EWMA will be SMOOTH_RTTLIFE us */
 #define SMOOTH_RTTLIFE 10000000
 /* this is used in smooth_ewma_update() */
-#define SMOOTH_MIN_K 8
+#define SMOOTH_MIN_K 4
 /* maximal iteration depth for smooth_sqrt() */
 static const u32 smooth_newton_max_iter = 100;
 
@@ -240,7 +240,7 @@ static u64 smooth_ewma_get(struct smooth_ewma *ewma_x)
 
 static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain);
 
-static void smooth_ewma_update(struct smooth_ewma *ewma_x, u32 e_life_us, u64 x, struct sock *sk)
+static void smooth_ewma_update(struct smooth_ewma *ewma_x, u32 e_life_us, u64 x, struct sock *sk, bool showbw)
 {
 	/*
 	 * Formula: 
@@ -262,7 +262,8 @@ static void smooth_ewma_update(struct smooth_ewma *ewma_x, u32 e_life_us, u64 x,
 	 k = e_life_us / t + SMOOTH_MIN_K;
 	 ewma_x->avg -= ewma_x->avg / k;
 	 ewma_x->avg += x / k;
-	 printk("SMOOTH: ewma_bw = %llu\tinstant_bw = %llu\tk = %u\nT = %u\tt = %u\n", bbr_rate_bytes_per_sec(sk, smooth_sqrt(ewma_x->avg), BBR_UNIT), bbr_rate_bytes_per_sec(sk, smooth_sqrt(x), BBR_UNIT), k, e_life_us, t); 
+	 if (showbw)
+	 	printk("SMOOTH: ewma_bw = %llu\tinstant_bw = %llu\tk = %u\nT = %u\tt = %u\n", bbr_rate_bytes_per_sec(sk, smooth_sqrt(ewma_x->avg), BBR_UNIT), bbr_rate_bytes_per_sec(sk, smooth_sqrt(x), BBR_UNIT), k, e_life_us, t); 
 }
 
 /* Do we estimate that STARTUP filled the pipe? */
@@ -779,7 +780,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 */
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
-		smooth_ewma_update(&bbr->bw2, bbr->dec_rtt_us * SMOOTH_BWLIFE, bw * bw, sk);
+		smooth_ewma_update(&bbr->bw2, bbr->dec_rtt_us * SMOOTH_BWLIFE, bw * bw, sk, 1);
 	}
 }
 
@@ -897,8 +898,8 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 
 	/* SMOOTH */
 	if (rs->rtt_us >= 0) {
-		smooth_ewma_update(&bbr->rtt, SMOOTH_RTTLIFE, (u64)(rs->rtt_us), sk);
-		smooth_ewma_update(&bbr->rtt2, SMOOTH_RTTLIFE, (u64)(rs->rtt_us) * rs->rtt_us, sk);
+		smooth_ewma_update(&bbr->rtt, SMOOTH_RTTLIFE, (u64)(rs->rtt_us), sk, 0);
+		smooth_ewma_update(&bbr->rtt2, SMOOTH_RTTLIFE, (u64)(rs->rtt_us) * rs->rtt_us, sk, 0);
 	}
 	rtt = smooth_ewma_get(&bbr->rtt);
 	rtt2 = smooth_ewma_get(&bbr->rtt2);
@@ -1064,7 +1065,7 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
-	printk("SMOOTH: v0.013\n");	/* SMOOTH */
+	printk("SMOOTH: v0.014\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
