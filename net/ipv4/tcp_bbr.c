@@ -61,7 +61,7 @@
 #include <linux/inet_diag.h>
 #include <linux/inet.h>
 #include <linux/random.h>
-#include <linux/win_minmax.h>
+#include <linux/proc_fs.h>
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -83,7 +83,7 @@ enum bbr_mode {
 	BBR_PROBE_RTT,	/* cut inflight to min to probe min_rtt */
 };
 
-/* SMOOTH */
+/* SMOOTH: the struct for EWMA */
 struct smooth_ewma {
 	u64 avg;
 	u32 timestamp;
@@ -94,7 +94,6 @@ struct bbr {
 	u32	min_rtt_us;	        /* min RTT in min_rtt_win_sec window */
 	u32	min_rtt_stamp;	        /* timestamp of min_rtt_us */
 	u32	probe_rtt_done_stamp;   /* end time for BBR_PROBE_RTT mode */
-	struct smooth_ewma bw2;	/* SMOOTH: EWMA'd BW^2 */
 	u32	rtt_cnt;	    /* count of packet-timed rounds elapsed */
 	u32     next_rtt_delivered; /* scb->tx.delivered at end of round */
 	u64	cycle_mstamp;	     /* time of this cycle phase start */
@@ -124,9 +123,10 @@ struct bbr {
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
 	/* SMOOTH parameters */
-	u32 dec_rtt_us;	/* decent RTT estimation */
+	u32 dec_rtt_us;			/* decent RTT estimation */
 	struct smooth_ewma rtt;		/* ~ EWMA'd RTT */
 	struct smooth_ewma rtt2;	/* ~ EWMA'd RTT^2 */
+	struct smooth_ewma bwp;		/* ~ EWMA'd BW^p */
 };
 
 #define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
@@ -152,8 +152,10 @@ static const int bbr_high_gain  = BBR_UNIT * 2885 / 1000 + 1;
 static const int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
 /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
 static const int bbr_cwnd_gain  = BBR_UNIT * 2;
-/* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
-static const int bbr_pacing_gain[] = {	/* SMOOTH */
+/* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw:
+ * SMOOTH: use the more aggresive strategy
+ */
+static const int bbr_pacing_gain[] = {
 	BBR_UNIT * 3 / 2, BBR_UNIT / 2,
 	BBR_UNIT * 3 / 2, BBR_UNIT / 2,
 	BBR_UNIT * 3 / 2, BBR_UNIT / 2,
@@ -186,45 +188,122 @@ static const u32 bbr_lt_bw_diff = 4000 / 8;
 /* If we estimate we're policed, use lt_bw for this many round trips: */
 static const u32 bbr_lt_bw_max_rtts = 48;
 
-/* 
- * SMOOTH constants 
+/*
+ * SMOOTH constants
+ * 	param(0):	smooth_alpha
+ * 	param(1):	smooth_bwlife
+ *	param(2):	smooth_rttlife
+ *	param(3):	smooth_ewmabase
+ *	param(4):	smooth_p
  */
 
-/* the shape parameter for the gamma distribution of RTTs */
-#define SMOOTH_GAMMA_ALPHA 2/3
-/* the (1/e)-life of the weight for EWMA will be SMOOTH_BWLIFE * dec_rtt_us */
-#define SMOOTH_BWLIFE 5
-/* the (1/e)-life of the weight for EWMA will be SMOOTH_RTTLIFE us */
-#define SMOOTH_RTTLIFE 10000000
+/* the shape parameter for the gamma distribution of RTTs,
+ * scaled with ALPHA_UNIT
+ */
+u32 smooth_alpha = 1024;
+/* the (1/e)-life of the weight for EWMA will be smooth_bwlife * dec_rtt_us */
+u32 smooth_bwlife = 5;
+/* the (1/e)-life of the weight for EWMA will be smooth_rttlife (us) */
+u32 smooth_rttlife = 10000000;
 /* this is used in smooth_ewma_update() */
-#define SMOOTH_MIN_K 4
+u32 smooth_ewmabase = 8000000;
+/* use p-th generalized mean dealing with bandwidth */
+u32 smooth_p = 2;
 /* maximal iteration depth for smooth_sqrt() */
 static const u32 smooth_newton_max_iter = 100;
 
-/* SMOOTH: Newton's iteration */
-static u64 smooth_sqrt(u64 n)
-{
-	u64 x, y, i;
+static struct proc_dir_entry *proc_param_entry;
 
-	if (n == 0)
-		return 0;
-	y = 1;
-	i = 0;
-	do {
-		x = y;
-		y = (x + n / x) / 2;
-		i = i + 1;
-	} while (x != y && i < smooth_newton_max_iter);
-	return y;
+#define MAX_PROC_SIZE 100
+static char proc_data[MAX_PROC_SIZE];
+
+#define ALPHA_UNIT 1024
+
+ssize_t write_proc(
+	struct file *file, const char __user *buf, size_t count, loff_t *data)
+{
+	if (count > MAX_PROC_SIZE)
+		count = MAX_PROC_SIZE;
+	if (copy_from_user(proc_data, buf, count))
+		return -EFAULT;
+	sscanf(proc_data, "%u%u%u%u%u", &smooth_alpha,
+		&smooth_bwlife, &smooth_rttlife, &smooth_ewmabase, &smooth_p);
+	printk("SMOOTH: Parameters updated.\nalpha = %u/%u\nbwlife = %u\nrttlife = %u\newmabase = %u\np = %u\n",
+		smooth_alpha, ALPHA_UNIT,
+		smooth_bwlife, smooth_rttlife, smooth_ewmabase, smooth_p);
+	return count;
 }
 
-/* 
- * SMOOTH: u64 timed-EWMA 
+ssize_t read_proc(
+	struct file *file, char __user *buf, size_t count, loff_t *data)
+{
+	return 0;
+}
+
+struct file_operations proc_fops = {
+	.read 	= 	read_proc,
+	.write 	= 	write_proc,
+	.owner 	= 	THIS_MODULE,
+};
+
+int create_new_proc_entry(void)
+{
+	proc_param_entry = proc_create("smooth_param", 0666, NULL, &proc_fops);
+	if (!proc_param_entry) {
+		printk("SMOOTH: Error creating proc entry.\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static u64 smooth_pow(u64 a, u32 n)
+{
+	u64 i, ret = 1;
+
+	for (i = 0; i < n; i++)
+		ret *= a;
+	return ret;
+}
+
+/* SMOOTH: Newton's iteration */
+static u64 smooth_nthroot(u64 a, u32 n)
+{
+	u64 x, i, j, t;
+
+	if (a == 0)
+		return 0;
+	x = 1;
+	i = 0;
+	do {
+		t = a;
+		for (j = 0; j < n - 1; j++)
+			t /= x;
+		t = (t - x) / n;
+		x += t;
+		i += 1;
+	} while (t > 0 && i < smooth_newton_max_iter);
+	return x;
+}
+
+/* SMOOTH: log2 */
+static u32 smooth_log(u64 n)
+{
+	u32 ret = 0;
+
+	while (n >= 2) {
+		ret += 1;
+		n /= 2;
+	}
+	return ret;
+}
+
+/*
+ * SMOOTH: u64 timed-EWMA
  * usage:	smooth_ewma_update(&ewma_x, e_life_us, time_us, x);
- *				e_life_us:	the (1/e)-life (instead of half-life) of the weight
- *				time_us:	time elapsed
- * 			smooth_ewma_get(&ewma_x);
- *			smooth_ewma_init(&ewma_x);
+ *		> e_life_us:	the (1/e)-life of the weight
+ *		> time_us:	time elapsed
+ * 		smooth_ewma_get(&ewma_x);
+ *		smooth_ewma_init(&ewma_x);
  */
 
 static void smooth_ewma_init(struct smooth_ewma *ewma_x, u64 x)
@@ -240,30 +319,39 @@ static u64 smooth_ewma_get(struct smooth_ewma *ewma_x)
 
 static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain);
 
-static void smooth_ewma_update(struct smooth_ewma *ewma_x, u32 e_life_us, u64 x, struct sock *sk, bool showbw)
+static void smooth_ewma_update(
+	struct smooth_ewma *ewma_x, u32 e_life_us, u64 x,
+	struct sock *sk, bool showbw)
 {
 	/*
-	 * Formula: 
+	 * Formula:
 	 *		ewma'_x = exp(-t/T)ewma_x + (1-exp(-t/T))x
 	 * where T = e_life_us and t = time_us.
-	 * By 
-	 *		x+1/2 <= (1-exp(-1/x))^(-1) <= x+1 
+	 * By
+	 *		x+1/2 <= (1-exp(-1/x))^(-1) <= x+1
 	 * we have
 	 * 		ewma'_x ~ (1-1/k)ewma_x + (1/k)x
-	 * where k = [T/t] + SMOOTH_MIN_K.
+	 * where k = [T/t] + [log([B/t]+1)] + 1 and B = smooth_ewmabase.
 	 */
-	 u32 k, t;
+	u32 k, t;
 
-	 t = tcp_jiffies32 - ewma_x->timestamp;
-	 ewma_x->timestamp = tcp_jiffies32;
-	 t = jiffies_to_usecs(t);
-	 if (t == 0)
-	 	return;
-	 k = e_life_us / t + SMOOTH_MIN_K;
-	 ewma_x->avg -= ewma_x->avg / k;
-	 ewma_x->avg += x / k;
-	 if (showbw)
-	 	printk("SMOOTH: ewma_bw = %llu\tinstant_bw = %llu\tk = %u\nT = %u\tt = %u\n", bbr_rate_bytes_per_sec(sk, smooth_sqrt(ewma_x->avg), BBR_UNIT), bbr_rate_bytes_per_sec(sk, smooth_sqrt(x), BBR_UNIT), k, e_life_us, t); 
+	t = max(tcp_jiffies32 - ewma_x->timestamp, 1U);
+	ewma_x->timestamp = tcp_jiffies32;
+	t = jiffies_to_usecs(t);
+	if (t == 0) {
+		printk("SMOOTH: error: t = 0 in smooth_ewma_update().\n");
+		return;
+	}
+	k = e_life_us / t + smooth_log(smooth_ewmabase / t + 1) + 1;
+	ewma_x->avg -= ewma_x->avg / k;
+	ewma_x->avg += x / k;
+	if (showbw)
+		printk("SMOOTH: ewma_bw = %llu\tinstant_bw = %llu\tk = %u\nT = %u\tt = %u\n",
+		    bbr_rate_bytes_per_sec(
+		        sk, smooth_nthroot(ewma_x->avg, smooth_p), BBR_UNIT),
+		    bbr_rate_bytes_per_sec(
+		        sk, smooth_nthroot(x, smooth_p), BBR_UNIT),
+		    k, e_life_us, t);
 }
 
 /* Do we estimate that STARTUP filled the pipe? */
@@ -279,7 +367,7 @@ static u32 bbr_max_bw(const struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	return smooth_sqrt(smooth_ewma_get(&bbr->bw2));
+	return smooth_nthroot(smooth_ewma_get(&bbr->bwp), smooth_p);
 }
 
 /* Return the estimated bandwidth of the path, in pkts/uS << BW_SCALE. */
@@ -780,7 +868,8 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 */
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
-		smooth_ewma_update(&bbr->bw2, bbr->dec_rtt_us * SMOOTH_BWLIFE, bw * bw, sk, 1);
+		smooth_ewma_update(&bbr->bwp, bbr->dec_rtt_us * smooth_bwlife,
+			smooth_pow(bw, smooth_p), sk, 1);
 	}
 }
 
@@ -896,18 +985,18 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	}
 	bbr->idle_restart = 0;
 
-	/* SMOOTH */
-	if (rs->rtt_us >= 0) {
-		smooth_ewma_update(&bbr->rtt, SMOOTH_RTTLIFE, (u64)(rs->rtt_us), sk, 0);
-		smooth_ewma_update(&bbr->rtt2, SMOOTH_RTTLIFE, (u64)(rs->rtt_us) * rs->rtt_us, sk, 0);
+	/* SMOOTH: maintain dec_rtt_us */
+	if ((bbr->mode == BBR_PROBE_BW || bbr->mode == BBR_PROBE_RTT) && rs->rtt_us >= 0) {
+		smooth_ewma_update(&bbr->rtt, smooth_rttlife, (u64)(rs->rtt_us), sk, 0);
+		smooth_ewma_update(&bbr->rtt2, smooth_rttlife, (u64)(rs->rtt_us) * rs->rtt_us, sk, 0);
 	}
 	rtt = smooth_ewma_get(&bbr->rtt);
 	rtt2 = smooth_ewma_get(&bbr->rtt2);
-	bbr->dec_rtt_us = bbr->min_rtt_us + smooth_sqrt(rtt2 - rtt * rtt) * SMOOTH_GAMMA_ALPHA;
+	bbr->dec_rtt_us = bbr->min_rtt_us + smooth_nthroot(rtt2 - rtt * rtt, 2) * smooth_alpha / ALPHA_UNIT;
 }
 
 /* SMOOTH */
-static void smooth_report_parameters(struct sock *sk, const struct rate_sample *rs) 
+static void smooth_report_parameters(struct sock *sk, const struct rate_sample *rs)
 {
 	struct inet_sock *inet = inet_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
@@ -961,12 +1050,12 @@ static void bbr_init(struct sock *sk)
 	bbr->min_rtt_stamp = tcp_jiffies32;
 
 	/* SMOOTH */
-	
+
 	bbr->dec_rtt_us = tcp_min_rtt(tp);
 
-	smooth_ewma_init(&bbr->bw2, 0);  /* init max bw to 0 */
-	smooth_ewma_init(&bbr->rtt, (u64)tcp_min_rtt(tp));
-	smooth_ewma_init(&bbr->rtt2, (u64)tcp_min_rtt(tp) * tcp_min_rtt(tp));
+	smooth_ewma_init(&bbr->bwp, 0);  /* init max bw to 0 */
+	smooth_ewma_init(&bbr->rtt, 0);
+	smooth_ewma_init(&bbr->rtt2, 0);
 
 	bbr->has_seen_rtt = 0;
 	bbr_init_pacing_rate_from_rtt(sk);
@@ -1065,12 +1154,14 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
 static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
-	printk("SMOOTH: v0.014\n");	/* SMOOTH */
+	create_new_proc_entry();
+	printk("SMOOTH: v0.1.003\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
 static void __exit bbr_unregister(void)
 {
+	remove_proc_entry("smooth_param", NULL);
 	tcp_unregister_congestion_control(&tcp_bbr_cong_ops);
 }
 
