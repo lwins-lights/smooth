@@ -202,15 +202,15 @@ static const u32 bbr_lt_bw_max_rtts = 48;
  */
 u32 smooth_alpha = 1024;
 /* the (1/e)-life of the weight for EWMA will be smooth_bwlife * dec_rtt_us */
-u32 smooth_bwlife = 5;
+u32 smooth_bwlife = 8;
 /* the (1/e)-life of the weight for EWMA will be smooth_rttlife (us) */
 u32 smooth_rttlife = 10000000;
 /* this is used in smooth_ewma_update() */
 u32 smooth_ewmabase = 8000000;
 /* use p-th generalized mean dealing with bandwidth */
-u32 smooth_p = 2;
+u32 smooth_p = 3;
 /* maximal iteration depth for smooth_sqrt() */
-static const u32 smooth_newton_max_iter = 100;
+static const u32 smooth_newton_max_iter = 1024;
 
 static struct proc_dir_entry *proc_param_entry;
 
@@ -258,17 +258,20 @@ int create_new_proc_entry(void)
 
 static u64 smooth_pow(u64 a, u32 n)
 {
-	u64 i, ret = 1;
+	u64 ret = 1;
+	u32 i;
 
 	for (i = 0; i < n; i++)
 		ret *= a;
+	/* printk("SMOOTH: pow(%llu, %u) = %llu\n", a, n, ret); */
 	return ret;
 }
 
 /* SMOOTH: Newton's iteration */
 static u64 smooth_nthroot(u64 a, u32 n)
 {
-	u64 x, i, j, t;
+	s64 x, t;
+	u32 i, j;
 
 	if (a == 0)
 		return 0;
@@ -281,7 +284,8 @@ static u64 smooth_nthroot(u64 a, u32 n)
 		t = (t - x) / n;
 		x += t;
 		i += 1;
-	} while (t > 0 && i < smooth_newton_max_iter);
+	} while (t != 0 && i < smooth_newton_max_iter);
+	/* printk("SMOOTH: root(%llu, %u) = %llu\n", a, n, x); */
 	return x;
 }
 
@@ -1155,7 +1159,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.1.003\n");	/* SMOOTH */
+	printk("SMOOTH: v0.1.007\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
