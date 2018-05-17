@@ -61,6 +61,7 @@
 #include <linux/inet_diag.h>
 #include <linux/inet.h>
 #include <linux/random.h>
+#include <linux/win_minmax.h>
 #include <linux/proc_fs.h>
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
@@ -68,8 +69,9 @@
  * This handles bandwidths from 0.06pps (715bps) to 256Mpps (3Tbps) in a u32.
  * Since the minimum window is >=4 packets, the lower bound isn't
  * an issue. The upper bound isn't an issue with existing technologies.
+ * SMOOTH: We use different BW_SCALE.
  */
-#define BW_SCALE 24
+#define BW_SCALE 16
 #define BW_UNIT (1 << BW_SCALE)
 
 #define BBR_SCALE 8	/* scaling factor for fractions in BBR (e.g. gains) */
@@ -94,6 +96,7 @@ struct bbr {
 	u32	min_rtt_us;	        /* min RTT in min_rtt_win_sec window */
 	u32	min_rtt_stamp;	        /* timestamp of min_rtt_us */
 	u32	probe_rtt_done_stamp;   /* end time for BBR_PROBE_RTT mode */
+	struct minmax bw;       /* Max recent delivery rate in pkts/uS << 24 */
 	u32	rtt_cnt;	    /* count of packet-timed rounds elapsed */
 	u32     next_rtt_delivered; /* scb->tx.delivered at end of round */
 	u64	cycle_mstamp;	     /* time of this cycle phase start */
@@ -209,6 +212,8 @@ u32 smooth_rttlife = 10000000;
 u32 smooth_ewmabase = 8000000;
 /* use p-th generalized mean dealing with bandwidth */
 u32 smooth_p = 3;
+/* enable smooth's bw estimator? */
+u32 smooth_enable_bwp = 1;
 /* maximal iteration depth for smooth_sqrt() */
 static const u32 smooth_newton_max_iter = 1024;
 
@@ -226,11 +231,11 @@ ssize_t write_proc(
 		count = MAX_PROC_SIZE;
 	if (copy_from_user(proc_data, buf, count))
 		return -EFAULT;
-	sscanf(proc_data, "%u%u%u%u%u", &smooth_alpha,
-		&smooth_bwlife, &smooth_rttlife, &smooth_ewmabase, &smooth_p);
-	printk("SMOOTH: Parameters updated.\nalpha = %u/%u\nbwlife = %u\nrttlife = %u\newmabase = %u\np = %u\n",
+	sscanf(proc_data, "%u%u%u%u%u%u", &smooth_alpha,
+		&smooth_bwlife, &smooth_rttlife, &smooth_ewmabase, &smooth_p, &smooth_enable_bwp);
+	printk("SMOOTH: Parameters updated.\nalpha = %u/%u\nbwlife = %u\nrttlife = %u\newmabase = %u\np = %u\nenable_bwp = %u\n",
 		smooth_alpha, ALPHA_UNIT,
-		smooth_bwlife, smooth_rttlife, smooth_ewmabase, smooth_p);
+		smooth_bwlife, smooth_rttlife, smooth_ewmabase, smooth_p, smooth_enable_bwp);
 	return count;
 }
 
@@ -371,7 +376,10 @@ static u32 bbr_max_bw(const struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	return smooth_nthroot(smooth_ewma_get(&bbr->bwp), smooth_p);
+	if (smooth_enable_bwp)
+		return smooth_nthroot(smooth_ewma_get(&bbr->bwp), smooth_p);
+	else
+		return minmax_get(&bbr->bw);
 }
 
 /* Return the estimated bandwidth of the path, in pkts/uS << BW_SCALE. */
@@ -873,7 +881,8 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
 		smooth_ewma_update(&bbr->bwp, bbr->dec_rtt_us * smooth_bwlife,
-			smooth_pow(bw, smooth_p), sk, 1);
+		    smooth_pow(bw, smooth_p), sk, 1);
+		minmax_running_max(&bbr->bw, bbr_bw_rtts, bbr->rtt_cnt, bw);
 	}
 }
 
@@ -1053,11 +1062,11 @@ static void bbr_init(struct sock *sk)
 	bbr->min_rtt_us = tcp_min_rtt(tp);
 	bbr->min_rtt_stamp = tcp_jiffies32;
 
+	minmax_reset(&bbr->bw, bbr->rtt_cnt, 0);  /* init max bw to 0 */
+
 	/* SMOOTH */
-
 	bbr->dec_rtt_us = tcp_min_rtt(tp);
-
-	smooth_ewma_init(&bbr->bwp, 0);  /* init max bw to 0 */
+	smooth_ewma_init(&bbr->bwp, 0); 
 	smooth_ewma_init(&bbr->rtt, 0);
 	smooth_ewma_init(&bbr->rtt2, 0);
 
@@ -1159,7 +1168,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.1.007\n");	/* SMOOTH */
+	printk("SMOOTH: v0.2.001\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
