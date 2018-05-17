@@ -71,7 +71,7 @@
  * an issue. The upper bound isn't an issue with existing technologies.
  * SMOOTH: We use different BW_SCALE.
  */
-#define BW_SCALE 16
+#define BW_SCALE 20
 #define BW_UNIT (1 << BW_SCALE)
 
 #define BBR_SCALE 8	/* scaling factor for fractions in BBR (e.g. gains) */
@@ -880,9 +880,11 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 */
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
-		smooth_ewma_update(&bbr->bwp, bbr->dec_rtt_us * smooth_bwlife,
-		    smooth_pow(bw, smooth_p), sk, 1);
-		minmax_running_max(&bbr->bw, bbr_bw_rtts, bbr->rtt_cnt, bw);
+		if (smooth_enable_bwp)
+			smooth_ewma_update(&bbr->bwp, bbr->dec_rtt_us * smooth_bwlife,
+			    smooth_pow(bw, smooth_p), sk, 1);
+		else
+			minmax_running_max(&bbr->bw, bbr_bw_rtts, bbr->rtt_cnt, bw);
 	}
 }
 
@@ -1168,7 +1170,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.2.001\n");	/* SMOOTH */
+	printk("SMOOTH: v0.2.011\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
