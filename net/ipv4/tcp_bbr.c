@@ -361,6 +361,7 @@ static void smooth_ewma_update(
 		    bbr_rate_bytes_per_sec(
 		        sk, smooth_nthroot(x, smooth_p), BBR_UNIT),
 		    k, e_life_us, t);
+	/* Safe Point */
 }
 
 /* Do we estimate that STARTUP filled the pipe? */
@@ -955,7 +956,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool filter_expired;
-	u64 rtt, rtt2;
+	u64 x, y;
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
 	filter_expired = after(tcp_jiffies32,
@@ -1005,9 +1006,13 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 		smooth_ewma_update(&bbr->rtt, smooth_rttlife, (u64)(rs->rtt_us), sk, 0);
 		smooth_ewma_update(&bbr->rtt2, smooth_rttlife, (u64)(rs->rtt_us) * rs->rtt_us, sk, 0);
 	}
-	rtt = smooth_ewma_get(&bbr->rtt);
-	rtt2 = smooth_ewma_get(&bbr->rtt2);
-	bbr->dec_rtt_us = bbr->min_rtt_us + smooth_nthroot(rtt2 - rtt * rtt, 2) * smooth_alpha / ALPHA_UNIT;
+	x = smooth_ewma_get(&bbr->rtt);
+	y = smooth_ewma_get(&bbr->rtt2);
+	x *= x;
+	if (y > x)
+		bbr->dec_rtt_us = bbr->min_rtt_us + smooth_nthroot(y - x, 2) * smooth_alpha / ALPHA_UNIT;
+	else
+		bbr->dec_rtt_us = bbr->min_rtt_us;
 }
 
 /* SMOOTH */
@@ -1170,7 +1175,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.2.011\n");	/* SMOOTH */
+	printk("SMOOTH: v0.2.017 (fixed?)\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
