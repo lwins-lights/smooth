@@ -1020,13 +1020,15 @@ static void smooth_report_parameters(struct sock *sk, const struct rate_sample *
 {
 	struct inet_sock *inet = inet_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
+	struct timeval tv;
 	u64 bw = bbr_bw(sk);
 
+	do_gettimeofday(&tv);
 	bw = bbr_rate_bytes_per_sec(sk, bw, BBR_UNIT);
 
-	printk("SMOOTH: %pI4:%u->%pI4:%u\nbw\trtt\tmin_rtt\tdec_rtt\tlt_flag\tstate\n%u\t%u\t%u\t%u\t%u\t%u\n",
-	 &(inet->inet_saddr), ntohs(inet->inet_sport), &(inet->inet_daddr),
-	  ntohs(inet->inet_dport), (u32)bw, (u32)rs->rtt_us, bbr->min_rtt_us, bbr->dec_rtt_us, (u32)((bool)bbr->lt_is_sampling), (u32)bbr->mode);
+	printk("SMOOTH: [%ld.%06ld] %pI4:%u->%pI4:%u\nbw(Kb)\trtt(ms)\tmin(ms)\tdec(ms)\tlt_flag\tstate\n%u\t%u\t%u\t%u\t%u\t%u\n",
+	 tv.tv_sec, tv.tv_usec, &(inet->inet_saddr), ntohs(inet->inet_sport), &(inet->inet_daddr),
+	  ntohs(inet->inet_dport), (u32)bw / 128, (u32)rs->rtt_us / 1000, bbr->min_rtt_us / 1000, bbr->dec_rtt_us / 1000, (u32)((bool)bbr->lt_is_sampling), (u32)bbr->mode);
 }
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
@@ -1175,7 +1177,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.2.017 (fixed?)\n");	/* SMOOTH */
+	printk("SMOOTH: v0.3.003\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
