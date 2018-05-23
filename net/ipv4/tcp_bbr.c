@@ -193,7 +193,7 @@ static const u32 bbr_lt_bw_max_rtts = 48;
 
 /*
  * SMOOTH constants
- * 	param(0):	smooth_alpha
+ * 	param(0):	smooth_alpha_default
  * 	param(1):	smooth_bwlife
  *	param(2):	smooth_rttlife
  *	param(3):	smooth_ewmabase
@@ -203,7 +203,10 @@ static const u32 bbr_lt_bw_max_rtts = 48;
 /* the shape parameter for the gamma distribution of RTTs,
  * scaled with ALPHA_UNIT
  */
-u32 smooth_alpha = 1024;
+#define ALPHA_UNIT 1024
+#define MAX_PORT_NUMBER 65536
+u32 smooth_alpha_default = 1024;
+u32 smooth_alpha[MAX_PORT_NUMBER];
 /* the (1/e)-life of the weight for EWMA will be smooth_bwlife * dec_rtt_us */
 u32 smooth_bwlife = 8;
 /* the (1/e)-life of the weight for EWMA will be smooth_rttlife (us) */
@@ -222,20 +225,31 @@ static struct proc_dir_entry *proc_param_entry;
 #define MAX_PROC_SIZE 100
 static char proc_data[MAX_PROC_SIZE];
 
-#define ALPHA_UNIT 1024
-
 ssize_t write_proc(
 	struct file *file, const char __user *buf, size_t count, loff_t *data)
 {
+	u32 n, i, x, y;
+
 	if (count > MAX_PROC_SIZE)
 		count = MAX_PROC_SIZE;
 	if (copy_from_user(proc_data, buf, count))
 		return -EFAULT;
-	sscanf(proc_data, "%u%u%u%u%u%u", &smooth_alpha,
-		&smooth_bwlife, &smooth_rttlife, &smooth_ewmabase, &smooth_p, &smooth_enable_bwp);
-	printk("SMOOTH: Parameters updated.\nalpha = %u/%u\nbwlife = %u\nrttlife = %u\newmabase = %u\np = %u\nenable_bwp = %u\n",
-		smooth_alpha, ALPHA_UNIT,
-		smooth_bwlife, smooth_rttlife, smooth_ewmabase, smooth_p, smooth_enable_bwp);
+	/* update parameters */
+	if (proc_data[0] == 'p') {
+		sscanf(proc_data, "p %u%u%u%u%u%u%u", &smooth_alpha_default,
+		    &smooth_bwlife, &smooth_rttlife, &smooth_ewmabase, &smooth_p, &smooth_enable_bwp, &n);
+		for (i = 0; i < MAX_PORT_NUMBER; i++)
+			smooth_alpha[i] = smooth_alpha_default;
+		printk("SMOOTH: Parameters updated.\nalpha_default = %u/%u\nbwlife = %u\nrttlife = %u\newmabase = %u\np = %u\nenable_bwp = %u\n",
+		    smooth_alpha_default, ALPHA_UNIT,
+		        smooth_bwlife, smooth_rttlife, smooth_ewmabase, smooth_p, smooth_enable_bwp);
+	}
+	/* assign alpha to specific port */
+	if (proc_data[0] == 'a') {
+		sscanf(proc_data, "a %u%u", &x, &y);
+		smooth_alpha[x] = y;
+		printk("SMOOTH: Port %u uses alpha = %u/%u.\n", x, smooth_alpha[x], ALPHA_UNIT);
+	}
 	return count;
 }
 
@@ -259,6 +273,13 @@ int create_new_proc_entry(void)
 		return -ENOMEM;
 	}
 	return 0;
+}
+
+static u32 smooth_get_alpha(struct sock *sk)
+{
+	struct inet_sock *inet = inet_sk(sk);
+
+	return smooth_alpha[ntohs(inet->inet_sport)];
 }
 
 static u64 smooth_pow(u64 a, u32 n)
@@ -1010,7 +1031,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	y = smooth_ewma_get(&bbr->rtt2);
 	x *= x;
 	if (y > x)
-		bbr->dec_rtt_us = bbr->min_rtt_us + smooth_nthroot(y - x, 2) * smooth_alpha / ALPHA_UNIT;
+		bbr->dec_rtt_us = bbr->min_rtt_us + smooth_nthroot(y - x, 2) * smooth_get_alpha(sk) / ALPHA_UNIT;
 	else
 		bbr->dec_rtt_us = bbr->min_rtt_us;
 }
@@ -1177,7 +1198,7 @@ static int __init bbr_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 	create_new_proc_entry();
-	printk("SMOOTH: v0.3.003\n");	/* SMOOTH */
+	printk("SMOOTH: v0.4.001 (+ assigning alpha)\n");	/* SMOOTH */
 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }
 
